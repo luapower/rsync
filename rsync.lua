@@ -3,12 +3,15 @@
 --rsync algorithm in Lua.
 --Written by Cosmin Apreutesei. Public Domain.
 
+if not ... then require'rsync_test' end
+
 local ffi = require'ffi'
 local bit = require'bit'
 local ringbuffer = require'ringbuffer'
 local shl, shr, bor, band = bit.lshift, bit.rshift, bit.bor, bit.band
+local pp = require'pp'
 
-local DEFAULT_BLOCK_LEN = 1024
+local default_block_len = 1024
 
 --rolling sum algorithm
 
@@ -65,148 +68,203 @@ end
 ffi.metatype(rollsum, rs)
 
 --generate weak and strong signatures for all the blocks of a stream.
-local function gen_signatures(read_file, write_sig, weak_sum, strong_sum, block_len)
-	local block_len = block_len or DEFAULT_BLOCK_LEN
-	local d1 = weak_sum()
-	local d2 = strong_sum()
+local function gen_signatures(
+	read_data,
+	write_sigs,
+	weak_sum,
+	strong_sum,
+	block_len
+)
+	local block_len = block_len or default_block_len
+	local weak_sum = weak_sum()
+	local strong_sum = strong_sum()
 	local buf = ffi.new('uint8_t[?]', block_len)
 	while true do
-		local len = assert(read_file(buf, block_len))
-		if len == 0 then break end
-		d1:reset()
-		d2:reset()
-		d1:update(buf, len)
-		d2:update(buf, len)
-		write_sig(d1:final(), d2:final())
-	end
-end
-
---replace `write_cmd(cmd, ...)` such that consecutive 'copy' blocks are merged.
-local function copy_cmd_merger(write_cmd)
-	local cmd0, ofs0, len0
-	return function(cmd, ...)
-		if cmd == 'copy' then
-			local ofs, len = ...
-			if cmd0 == 'copy' then --consecutive copy command
-				if ofs == ofs0 + len0 then --consecutive block, merge it
-					len0 = len0 + len
-				else --non-consecutive block
-					write_cmd('copy', ofs0, len0) --flush pending command
-					ofs0, len0 = ofs, len --replace pending command with this one
-				end
-			else --first copy command
-				ofs0, len0 = ofs, len --start pending command
-			end
-		else --unknown command
-			if cmd0 == 'copy' then
-				write_cmd('copy', ofs0, len0) --flush pending command
-			end
-			write_cmd(cmd, ...) --pass-through
-		end
-		cmd0 = cmd
+		local len = assert(read_data(buf, block_len))
+		if len ~= block_len then break end
+		weak_sum:reset()
+		strong_sum:reset()
+		weak_sum:update(buf, len)
+		strong_sum:update(buf, len)
+		write_sigs(weak_sum:final(), strong_sum:final())
 	end
 end
 
 --generate deltas for a stream and a list of strong+weak signature pairs
-local function gen_delta(read_file, read_sigs, write_cmd,
-	weak_sum, strong_sum, block_len, databufsize)
+local function gen_deltas(
+	read_data,
+	read_sigs,
+	write_cmd,
+	weak_sum,
+	strong_sum,
+	block_len,
+	buf_size
+)
 
-	local block_len = block_len or DEFAULT_BLOCK_LEN
+	local block_len = block_len or default_block_len
 
-	local t1 = {} --{sig1 -> true}
-	local t2 = {} --{sig2 -> offset}
-	local offset = 0
-	for sig1, sig2 in read_sigs do
-		t1[sig1] = true
-		t2[sig2] = offset
-		offset = offset + block_len
+	local weak_sigs = {}
+	local strong_sigs = {}
+	local block_num = 1
+	for weak_sig, strong_sig in read_sigs do
+		weak_sigs[weak_sig] = true
+		strong_sigs[strong_sig] = block_num
+		block_num = block_num + 1
 	end
 
-	local rb = ringbuffer{size = block_len, ctype = 'uint8_t'}
-	local d1 = weak_sum()
-	local d2 = strong_sum()
-	local write_cmd = copy_cmd_merger(write_cmd, block_len)
+	local mem_len = math.max(block_len * 2, buf_size or 0)
+	local mem = ffi.new('uint8_t[?]', mem_len)
+	local data = mem
+	local block = mem
+	local data_len = read_data(data, mem_len)
 
-	local hashed, byte1
-
-	local databuf = ffi.new('uint8_t[?]', databufsize)
-	local dataofs = 0
-
-	local function flush_data()
-		write_cmd('data', databuf, dataofs)
-		dataofs = 0
-	end
-
-	local function append_byte(byte)
-		if dataofs == databufsize then
-			flush_data()
+	if data_len < block_len then
+		if data_len > 0 then
+			write_cmd('data', data, data_len)
 		end
-		databuf[dataofs] = byte
-		dataofs = dataofs + 1
+		return
 	end
 
-	local function check_rb() --rb is either full or containing the last segment
-		if not hashed then
-			d1:reset()
-			local i1, n1, i2, n2 = rb:segments()
-			d1:update(rb.data + i1, n1)
-			if n2 > 0 then
-				d1:update(rb.data + i2, n2)
+	local weak_sum = weak_sum()
+	local strong_sum = strong_sum()
+
+	--take a function which operates on a buffer segment and which has the
+	--same effect if called multiple times on consecutive pieces of that
+	--segment and turn it into a function that works on a ringbuffer.
+	local function split(f)
+		return function(p, len)
+			if len == 0 then
+				return 0
 			end
-			hashed = true
+			if p + len > mem + mem_len then
+				local len1 = mem_len - (p - mem)
+				local r1 = f(p, len1)
+				local r2 = f(p, len - len1)
+				return r1, r2
+			else
+				return f(p, len), 0
+			end
+		end
+	end
+
+	local update_weak_sum = split(function(p, len)
+		weak_sum:update(p, len)
+	end)
+	local update_strong_sum = split(function(p, len)
+		strong_sum:update(p, len)
+	end)
+	local write_data = split(function(p, len)
+		write_cmd('data', p, len)
+	end)
+	local load_data = split(function(p, len)
+		return read_data(p, len)
+	end)
+
+	local function ptr_inc(p, len)
+		if (p - mem) + len >= mem_len then
+			return p + len - mem_len
 		else
-			local byte2 = rb.data[rb:tail(-1)]
-			d1:rotate(byte1, byte2)
+			return p + len
 		end
-		local sig1 = d1:final()
-		local v = t1[sig1]
-		if v then
-			d2:reset()
-			local i1, n1, i2, n2 = rb:segments()
-			d2:update(rb.data + i1, n1)
-			if n2 > 0 then
-				d2:update(rb.data + i2, n2)
-			end
-			local sig2 = d2:final()
-			local offset1 = t2[sig2]
-			if offset1 then
-				if byte1 then
-					flush_data()
-					byte1 = nil
-				end
-				write_cmd('copy', offset1, rb.length)
-				rb:pull(rb.length)
-				hashed = nil
-				return
-			end
-		end
-		if byte1 then
-			append_byte(byte1)
-		end
-		local i = rb:pull(1)
-		byte1 = rb.data[i]
 	end
 
-	local buf = ffi.new('uint8_t[?]', block_len)
-	while true do
-		local len = assert(read_file(buf, block_len))
-		if len == 0 then break end
-		while len > 0 do
-			local pushlen = math.min(len, rb.size - rb.length)
-			if pushlen > 0 then
-				rb:push(pushlen, buf)
-			end
-			if rb.size - rb.length == 0 then
-				check_rb()
-			end
-			len = len - pushlen
-			buf = buf + pushlen
+	local function ptr_diff(p1, p2)
+		local diff = p1 - p2
+		if diff < 0 then
+			return diff + mem_len
+		else
+			return diff
 		end
 	end
-	while rb.length > 0 do
-		check_rb()
+
+	local function load_more_data(required_len)
+		local free_len = mem_len - data_len
+		assert(free_len >= required_len)
+		while required_len > 0 do
+			local len1, len2 = load_data(ptr_inc(data, data_len), free_len)
+			local len = len1 + len2
+			if len == 0 then return end --eof
+			data_len = data_len + len
+			free_len = free_len - len
+			required_len = required_len - len
+		end
+		return true
 	end
-	write_cmd'end'
+
+	local function write_data_before_block()
+		local write_len = ptr_diff(block, data)
+		if write_len == 0 then return end
+		write_data(data, write_len)
+		data = block
+		data_len = data_len - write_len
+	end
+
+	::check_new_block::
+	weak_sum:reset()
+	strong_sum:reset()
+	update_weak_sum(block, block_len)
+
+	::check_block::
+	do
+		local weak_sig = weak_sum:final()
+		if not weak_sigs[weak_sig] then
+			goto advance_block
+		end
+		update_strong_sum(block, block_len)
+		local strong_sig = strong_sum:final()
+		local block_num = strong_sigs[strong_sig]
+		if not block_num then
+			goto advance_block
+		end
+
+		write_data_before_block()
+
+		write_cmd('copy', block_num)
+		block = ptr_inc(block, block_len)
+		data = block
+		data_len = data_len - block_len
+
+		if data_len < block_len then
+			if not load_more_data(block_len - data_len) then
+				goto finish
+			end
+		end
+		goto check_new_block
+	end
+
+	::advance_block::
+	do
+		local lost_byte = block[0]
+		block = ptr_inc(block, 1)
+		if ptr_diff(block, data) + block_len > data_len then
+			write_data_before_block()
+			if not load_more_data(1) then
+				goto finish
+			end
+		end
+		weak_sum:rotate(lost_byte, ptr_inc(block, block_len-1)[0])
+		goto check_block
+	end
+
+	::finish::
+	if data_len > 0 then
+		write_data(data, data_len)
+	end
+
+end
+
+local function patch(read_cmd, read_data, write_data, block_len)
+	block_len = block_len or default_block_len
+	local block = ffi.new('uint8_t[?]', block_len)
+	for cmd, arg1, arg2 in read_cmd do
+		if cmd == 'copy' then
+			local offset = (arg1 - 1) * block_len --arg1 is block_num
+			read_data(offset, block, block_len)
+			write_data(block, block_len)
+		elseif cmd == 'data' then
+			write_data(arg1, arg2 or #arg1) --(buf, sz) or (string)
+		end
+	end
 end
 
 --serialization and deserialization of signatures, deltas and patching.
@@ -222,24 +280,24 @@ local bswap64 = ffi.abi'le' and pass or function(x)
 
 end
 
-local function sig_serializer(write_file, sig2_len)
+local function sig_serializer(write_file, strong_sig_len)
 	local ibuf = ffi.new'int32_t[1]'
-	return function(sig1, sig2)
-		ibuf[0] = bswap(sig1)
+	return function(weak_sig, strong_sig)
+		ibuf[0] = bswap(weak_sig)
 		write_file(ffi.cast('const char*', ibuf), 4)
-		write_file(ffi.cast('const char*', sig2), sig2_len)
+		write_file(ffi.cast('const char*', strong_sig), strong_sig_len)
 	end
 end
 
-local function sig_loader(read_file, sig2_len)
+local function sig_loader(read_data, strong_sig_len)
 	local ibuf = ffi.new'int32_t[1]'
-	local sbuf = ffi.new('uint8_t[?]', sig2_len)
+	local sbuf = ffi.new('uint8_t[?]', strong_sig_len)
 	return function()
-		assert(read_file(ibuf, 4) == 4)
-		local sig1 = bswap(ibuf[0])
-		assert(read_file(sbuf, sig2_len) == sig2_len)
-		local sig2 = ffi.string(sbuf, sig2_len)
-		return sig1, sig2
+		assert(read_data(ibuf, 4) == 4)
+		local weak_sig = bswap(ibuf[0])
+		assert(read_data(sbuf, strong_sig_len) == strong_sig_len)
+		local strong_sig = ffi.string(sbuf, strong_sig_len)
+		return weak_sig, strong_sig
 	end
 end
 
@@ -266,19 +324,19 @@ local function delta_serializer(write_file)
 	end
 end
 
-local function delta_loader(read_file, write_cmd)
+local function delta_loader(read_data, write_cmd)
 	local cbuf = delta_ct()
 	local p = ffi.cast('char*', cbuf)+1
 	local dbuf = ffi.new('uint8_t[?]', 2^16)
-	assert(read_file(p, 2+8) == 2+8)
-	assert(read_file(cbuf, 1) == 1) --read the cmd byte
+	assert(read_data(p, 2+8) == 2+8)
+	assert(read_data(cbuf, 1) == 1) --read the cmd byte
 	if cbuf.cmd == 0 then --data
-		assert(read_file(p, 2) == 2)
+		assert(read_data(p, 2) == 2)
 		local len = bswap16(cbuf.len)
-		assert(read_file(dbuf, len) == len)
+		assert(read_data(dbuf, len) == len)
 		write_cmd('data', dbuf, len)
 	elseif cbuf.cmd == 1 then --copy
-		assert(read_file(p, 2+8) == 2+8)
+		assert(read_data(p, 2+8) == 2+8)
 		local len = bswap16(cbuf.len)
 		local ofs = bswap64(cbuf.offset)
 		write_cmd('copy', ofs, len)
@@ -287,24 +345,11 @@ local function delta_loader(read_file, write_cmd)
 	end
 end
 
-local function patch(read_cmd, read_file, write_file)
-	for cmd, arg1, arg2 in read_cmd do
-		if cmd == 'copy' then
-			local ofs, len = arg1, arg2
-			--read_file(
-			copy(arg1, arg2) --offset, len
-		elseif cmd == 'data' then
-			local data, len = arg1, arg2
-			write(arg1, arg2) --data, len
-		end
-	end
-end
-
 return {
 	--algorithm
 	rollsum = rollsum,
 	gen_signatures = gen_signatures,
-	gen_delta = gen_delta,
+	gen_deltas = gen_deltas,
 	--serialization
 	sig_serializer = sig_serializer,
 	sig_loader = sig_loader,
