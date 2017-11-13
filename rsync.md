@@ -2,6 +2,8 @@
 tagline: rsync algorithm in Lua
 ---
 
+## `local rsync = require'rsync'`
+
 The [RSYNC algorithm](https://rsync.samba.org/tech_report/) in Lua.
 
 This library can be used to synchronize similar-but-not-identical files
