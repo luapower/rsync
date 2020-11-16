@@ -59,7 +59,7 @@ ffi.metatype(rollsum, rs)
 
 local rsync = {}
 
-function rsync:new(config) --create a derived module with overriden config
+function rsync:new(config) --create a derived module with overridden config
 	local mod = setmetatable({}, {__index = rsync})
 	if config then
 		for k,v in pairs(config) do
