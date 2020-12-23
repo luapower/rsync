@@ -1,8 +1,8 @@
 local glue = require'glue'
 local ffi = require'ffi'
+local fs = require'fs'
 local rsync = require'rsync'
 local blake2 = require'blake2'
-local stdio = require'stdio'
 local pp = require'pp'
 local time = require'time'
 
@@ -88,11 +88,10 @@ local function cmd_logger(block_len, verbose)
 end
 
 local function file_reader(file)
-	local f = assert(io.open(file, 'rb'))
-	local stdio_reader = stdio.reader(f)
+	local f = assert(fs.open(file, 'r'))
 	local total_len = 0
 	local function reader(buf, max_len)
-		local len = stdio_reader(buf, max_len)
+		local len = f:read(buf, max_len)
 		total_len = total_len + len
 		return len
 	end
@@ -107,11 +106,10 @@ local function filename(file, ext)
 end
 
 local function file_writer(file)
-	local f = assert(io.open(file, 'wb'))
-	local stdio_writer = stdio.writer(f)
+	local f = assert(fs.open(file, 'w'))
 	local total_len = 0
 	local function writer(buf, len)
-		stdio_writer(buf, len)
+		f:write(buf, len)
 		total_len = total_len + len
 	end
 	local function get_len()
@@ -127,12 +125,12 @@ local function diff(file1, file2)
 	local block_len = 1024 * 64
 	local block1 = ffi.new('uint8_t[?]', block_len)
 	local block2 = ffi.new('uint8_t[?]', block_len)
-	local f1 = io.open(file1, 'rb')
-	local f2 = io.open(file2, 'rb')
+	local f1 = fs.open(file1, 'r')
+	local f2 = fs.open(file2, 'r')
 	local total_len = 0
 	while true do
-		local len1 = assert(stdio.read(f1, block1, block_len))
-		local len2 = assert(stdio.read(f2, block2, block_len))
+		local len1 = assert(f1:read(block1, block_len))
+		local len2 = assert(f2:read(block2, block_len))
 		assert(len1 == len2)
 		if len1 == 0 then break end
 		assert(ffi.C.memcmp(block1, block2, len1) == 0)
@@ -195,11 +193,10 @@ local function test_files(file1, file2, block_len)
 	--patch file1 from deltas file + file1 into the output file
 
 	mbs()
-	local _, f1 = file_reader(file1)
+	local read, f1 = file_reader(file1)
 	local function seek(offset)
 		assert(f1:seek('set', offset))
 	end
-	local read = stdio.reader(f1)
 	local read_fd, fd = file_reader(deltas_file)
 	local read_cmd = rsync:cmd_reader(read_fd)
 	local write_fout, fout, out_len = file_writer(out_file)
@@ -219,15 +216,15 @@ end
 local function test_copy(file1, block_len)
 	mbs()
 	local block = ffi.new('uint8_t[?]', block_len)
-	local f1 = io.open(file1, 'rb')
+	local f1 = assert(fs.open(file1, 'r'))
 	local file2 = filename(file1, 'copy')
-	local f2 = io.open(file2, 'wb')
+	local f2 = assert(fs.open(file2, 'w'))
 	local total_len = 0
 	local total_blocks = 0
 	while true do
-		local len = assert(stdio.read(f1, block, block_len))
+		local len = assert(f1:read(block, block_len))
 		if len == 0 then break end
-		assert(stdio.write(f2, block, len))
+		assert(f2:write(block, len))
 		total_len = total_len + len
 		total_blocks = total_blocks + 1
 	end
@@ -240,23 +237,24 @@ local function test_copy(file1, block_len)
 		block_len)
 end
 
-test_copy('media/rsync/linux-master.tar', 1024 * 64)
+test_copy('media/rsync/linux-5.10.tar', 1024 * 64)
 
+--[[
 test_files(
-	'media/rsync/linux-master.tar',
-	'media/rsync/linux-master.tar',
+	'media/rsync/linux-5.4.85.tar',
+	'media/rsync/linux-5.10.tar',
 	691
 )
+]]
 
 test_files(
-	--'media/rsync/linux-4.10-rc2.tar',
-	'media/rsync/linux-4.14-rc7.tar',
-	--'media/rsync/linux-master.tar',
-	'media/rsync/linux-master.tar',
+	'media/rsync/linux-5.4.85.tar',
+	'media/rsync/linux-5.10.tar',
 	1024
 	--691
 )
 
+--[[
 test_files(
 	'media/rsync/freetype2-VER-2-5-0.tar',
 	'media/rsync/freetype2-master.tar',
@@ -268,4 +266,4 @@ test_files(
 	'media/rsync/cairo-master.tar',
 	1117
 )
-
+]]
